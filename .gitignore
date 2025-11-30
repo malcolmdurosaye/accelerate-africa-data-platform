@@ -1,0 +1,13 @@
+# Security: Never upload secrets
+.env
+
+# Database: Never upload the local data file (it's too big & insecure)
+*.db
+accelerate_africa.db
+
+# Python cache & junk
+__pycache__/
+*.pyc
+.DS_Store
+.venv
+venv/

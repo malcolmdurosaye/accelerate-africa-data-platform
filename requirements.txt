@@ -1,0 +1,11 @@
+pandas
+dash
+dash-bootstrap-components
+sqlalchemy
+requests
+python-dotenv
+openpyxl
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
