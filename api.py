@@ -11,7 +11,7 @@ load_dotenv()
 app = FastAPI(
     title="Accelerate Africa Data API",
     description="API for accessing application data securely.",
-    version="1.0"
+    version="2.0"
 )
 
 # 2. CORS
@@ -32,19 +32,6 @@ def get_db_engine():
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     return create_engine(db_url)
 
-# HELPER: Find column safely
-def find_column(available_columns, targets):
-    # 1. Exact match
-    for target in targets:
-        if target in available_columns:
-            return f'"{target}"'
-    # 2. Case-insensitive match
-    for target in targets:
-        for col in available_columns:
-            if target.lower() == col.lower():
-                return f'"{col}"'
-    return None
-
 # 4. ENDPOINTS
 
 @app.get("/")
@@ -55,64 +42,72 @@ def read_root():
 def get_applications(limit: int = 1000):
     try:
         engine = get_db_engine()
-        query = f'SELECT * FROM applications LIMIT {limit}'
+        
+        # [cite_start]We now query specific STANDARD columns [cite: 1, 2, 4, 6, 8]
+        # This prevents sending internal fields (like airtable_id) if you don't want to.
+        query = f"""
+            SELECT 
+                "SN",
+                "Cohort",
+                applicant_name,
+                startup_name,
+                startup_website_url,
+                "Country",
+                industry_name,
+                product_description,
+                application_status,
+                monthly_revenue_usd,
+                total_raised_usd,
+                founding_date,
+                created_at
+            FROM applications 
+            LIMIT {limit}
+        """
+        
         df = pd.read_sql(query, engine)
         
         if df.empty:
             return {"count": 0, "data": []}
 
-        # Convert NaNs to None
+        # Convert NaNs to None for JSON
         df = df.where(pd.notnull(df), None)
-        return {"count": len(df), "data": df.to_dict(orient="records")}
+        
+        return {
+            "count": len(df),
+            "data": df.to_dict(orient="records")
+        }
         
     except Exception as e:
         print(f"❌ API CRASHED: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Fallback: If specific columns fail, just grab everything
+        try:
+            engine = get_db_engine()
+            df = pd.read_sql(f"SELECT * FROM applications LIMIT {limit}", engine)
+            df = df.where(pd.notnull(df), None)
+            return {"count": len(df), "data": df.to_dict(orient="records"), "warning": "Used fallback query"}
+        except Exception as e2:
+             raise HTTPException(status_code=500, detail=str(e2))
 
 @app.get("/api/stats")
 def get_stats():
+    """
+    [cite_start]Calculates stats using the DB Standard Field Names [cite: 1, 2, 4, 6, 8]
+    """
     try:
         engine = get_db_engine()
-        
-        # 1. Get available columns
-        cols_df = pd.read_sql("SELECT * FROM applications LIMIT 0", engine)
-        all_cols = list(cols_df.columns)
-        
-        # 2. Find Country Column
-        country_col = find_column(all_cols, ["Country", "country", "location", "Location"])
-        
-        # 3. Find Funding Column (Strict List)
-        raised_col = find_column(all_cols, [
-            "total_raised_usd", 
-            "total_raised", 
-            "latest_fundraise_usd",
-            "Fundraise Amount ($)"
-        ])
-        
-        # Fallbacks if columns are missing
-        if not country_col: 
-            # If we can't find country, we can't count countries, so we use a dummy string
-            country_sql = "'Unknown'" 
-        else:
-            country_sql = country_col
 
-        if not raised_col:
-            # If we can't find the money column, return 0 instead of crashing
-            raised_sql = "0"
-        else:
-            # CLEANING LOGIC:
-            # 1. Cast to TEXT (in case it's already numeric)
-            # 2. REGEXP_REPLACE: Remove anything that is NOT a digit or a dot (removes $ , letters)
-            # 3. NULLIF: If the result is empty string, make it NULL
-            # 4. CAST: Finally turn it into a Number
-            raised_sql = f"CAST(NULLIF(REGEXP_REPLACE(CAST({raised_col} AS TEXT), '[^0-9.]', '', 'g'), '') AS NUMERIC)"
-
-        # 4. EXECUTE QUERY
-        query = f"""
+        # We use the CLEAN column names directly now:
+        # 'Country' -> Standardized in secure_update.py
+        # 'total_raised_usd' -> Standardized in secure_update.py
+        
+        query = """
             SELECT 
                 COUNT(*) as total_apps,
-                COUNT(DISTINCT {country_sql}) as total_countries,
-                SUM({raised_sql}) as total_raised
+                COUNT(DISTINCT "Country") as total_countries,
+                SUM(
+                    -- Safe cleaning: Remove non-digits, treat empty as 0
+                    CAST(NULLIF(REGEXP_REPLACE(CAST(total_raised_usd AS TEXT), '[^0-9.]', '', 'g'), '') AS NUMERIC)
+                ) as total_raised
             FROM applications
         """
         
@@ -123,7 +118,7 @@ def get_stats():
 
     except Exception as e:
         print(f"❌ STATS ERROR: {e}")
-        # Return a safe error response instead of a 500 crash
+        # Return 0s so frontend doesn't break
         return {
             "total_apps": 0,
             "total_countries": 0,
