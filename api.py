@@ -4,6 +4,7 @@ from sqlalchemy import create_engine, text
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import re
 
 # 1. SETUP
 load_dotenv()
@@ -33,23 +34,24 @@ def get_db_engine():
     return create_engine(db_url)
 
 # HELPER: Find the real column name dynamically
-def find_column(available_columns, targets, search_term=None):
+def find_column(available_columns, targets):
     """
-    1. Checks if any 'target' exists exactly in available_columns.
-    2. If not, searches for 'search_term' inside available_columns.
-    3. Returns the first match or None.
+    Checks if any 'target' exists exactly in available_columns.
+    Returns the quoted column name or None.
     """
-    # Exact match check
+    # 1. Check strict exact matches first (Highest Priority)
     for target in targets:
         if target in available_columns:
-            return f'"{target}"' # Return quoted for SQL safety
+            return f'"{target}"'
             
-    # Fuzzy search check (case insensitive)
-    if search_term:
+    # 2. Check case-insensitive match
+    for target in targets:
         for col in available_columns:
-            if search_term.lower() in col.lower():
+            if target.lower() == col.lower():
                 return f'"{col}"'
-                
+    
+    # 3. Last resort: Partial match (Riskier, but better than nothing)
+    # We skip this for 'raised' to avoid picking the text question column
     return None
 
 # 4. ENDPOINTS
@@ -62,21 +64,14 @@ def read_root():
 def get_applications(limit: int = 1000):
     try:
         engine = get_db_engine()
-        
-        # Safer Approach: Select * to get whatever columns exist
         query = f'SELECT * FROM applications LIMIT {limit}'
         df = pd.read_sql(query, engine)
         
         if df.empty:
             return {"count": 0, "data": []}
 
-        # Convert NaNs to None
         df = df.where(pd.notnull(df), None)
-        
-        return {
-            "count": len(df),
-            "data": df.to_dict(orient="records")
-        }
+        return {"count": len(df), "data": df.to_dict(orient="records")}
         
     except Exception as e:
         print(f"❌ API CRASHED: {e}")
@@ -87,31 +82,39 @@ def get_stats():
     try:
         engine = get_db_engine()
         
-        # 1. Inspect Database Columns first
-        # We fetch 0 rows just to see the column names
+        # 1. Get Column Names
         cols_df = pd.read_sql("SELECT * FROM applications LIMIT 0", engine)
         all_cols = list(cols_df.columns)
         
-        # 2. Dynamically find the right columns
-        # Country: Look for "Country" or "country" or "Location"
-        country_col = find_column(all_cols, ["Country", "country", "location"])
+        # 2. Find Country Column
+        country_col = find_column(all_cols, ["Country", "country", "location", "Location"])
         
-        # Total Raised: Look for "total_raised_usd", "total_raised", or anything with "raised"
-        raised_col = find_column(all_cols, ["total_raised_usd", "total_raised", "Total Raised"], search_term="raised")
+        # 3. Find Funding Column (STRICT LIST ONLY)
+        # We removed the fuzzy search so it doesn't pick the text question again.
+        raised_col = find_column(all_cols, [
+            "total_raised_usd", 
+            "total_raised", 
+            "latest_fundraise_usd",
+            "Fundraise Amount ($)",
+            "How much money have you raised from investors, including friends and family, in total in US Dollars? "
+        ])
         
-        if not country_col or not raised_col:
-            # Fallback for debugging if we can't find them
-            return {
-                "error": "Could not identify columns", 
-                "available_columns": all_cols
-            }
+        if not country_col: country_col = '"Country"' # Default fallback
+        if not raised_col: raised_col = '"total_raised_usd"' # Default fallback
 
-        # 3. Construct the query using the found names
+        # 4. SAFE QUERY
+        # We use a REGEX check to only sum values that look like numbers.
+        # If it contains text like "N/A", it counts as 0.
         query = f"""
             SELECT 
                 COUNT(*) as total_apps,
                 COUNT(DISTINCT {country_col}) as total_countries,
-                SUM(CAST({raised_col} AS NUMERIC)) as total_raised
+                SUM(
+                    CASE 
+                        WHEN {raised_col} ~ '^[0-9\.]+$' THEN CAST({raised_col} AS NUMERIC)
+                        ELSE 0 
+                    END
+                ) as total_raised
             FROM applications
         """
         
