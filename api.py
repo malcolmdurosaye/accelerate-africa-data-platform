@@ -32,6 +32,26 @@ def get_db_engine():
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     return create_engine(db_url)
 
+# HELPER: Find the real column name dynamically
+def find_column(available_columns, targets, search_term=None):
+    """
+    1. Checks if any 'target' exists exactly in available_columns.
+    2. If not, searches for 'search_term' inside available_columns.
+    3. Returns the first match or None.
+    """
+    # Exact match check
+    for target in targets:
+        if target in available_columns:
+            return f'"{target}"' # Return quoted for SQL safety
+            
+    # Fuzzy search check (case insensitive)
+    if search_term:
+        for col in available_columns:
+            if search_term.lower() in col.lower():
+                return f'"{col}"'
+                
+    return None
+
 # 4. ENDPOINTS
 
 @app.get("/")
@@ -43,17 +63,14 @@ def get_applications(limit: int = 1000):
     try:
         engine = get_db_engine()
         
-        # FIX: We select ALL columns first to avoid "Column Not Found" errors.
-        # This is safer than typing specific names that might be misspelled.
+        # Safer Approach: Select * to get whatever columns exist
         query = f'SELECT * FROM applications LIMIT {limit}'
-        
         df = pd.read_sql(query, engine)
         
-        # Handle empty DB
         if df.empty:
             return {"count": 0, "data": []}
 
-        # CLEANUP: Convert NaNs to None for JSON compatibility
+        # Convert NaNs to None
         df = df.where(pd.notnull(df), None)
         
         return {
@@ -70,13 +87,31 @@ def get_stats():
     try:
         engine = get_db_engine()
         
-        # FIX: We use double quotes around "Country" because Postgres is case-sensitive.
-        # We also added a fallback for "Industry" just in case.
-        query = """
+        # 1. Inspect Database Columns first
+        # We fetch 0 rows just to see the column names
+        cols_df = pd.read_sql("SELECT * FROM applications LIMIT 0", engine)
+        all_cols = list(cols_df.columns)
+        
+        # 2. Dynamically find the right columns
+        # Country: Look for "Country" or "country" or "Location"
+        country_col = find_column(all_cols, ["Country", "country", "location"])
+        
+        # Total Raised: Look for "total_raised_usd", "total_raised", or anything with "raised"
+        raised_col = find_column(all_cols, ["total_raised_usd", "total_raised", "Total Raised"], search_term="raised")
+        
+        if not country_col or not raised_col:
+            # Fallback for debugging if we can't find them
+            return {
+                "error": "Could not identify columns", 
+                "available_columns": all_cols
+            }
+
+        # 3. Construct the query using the found names
+        query = f"""
             SELECT 
                 COUNT(*) as total_apps,
-                COUNT(DISTINCT "Country") as total_countries,
-                SUM(CAST(total_raised_usd AS NUMERIC)) as total_raised
+                COUNT(DISTINCT {country_col}) as total_countries,
+                SUM(CAST({raised_col} AS NUMERIC)) as total_raised
             FROM applications
         """
         
@@ -87,20 +122,4 @@ def get_stats():
 
     except Exception as e:
         print(f"❌ STATS ERROR: {e}")
-        
-        # Fallback: If "Country" (Big C) fails, try "country" (small c)
-        # This handles the case where your database might have different casing.
-        try:
-            engine = get_db_engine()
-            query_fallback = """
-                SELECT 
-                    COUNT(*) as total_apps,
-                    COUNT(DISTINCT country) as total_countries,
-                    SUM(CAST(total_raised_usd AS NUMERIC)) as total_raised
-                FROM applications
-            """
-            with engine.connect() as conn:
-                result = conn.execute(text(query_fallback)).mappings().first()
-            return dict(result)
-        except:
-            raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Stats Error: {str(e)}")
