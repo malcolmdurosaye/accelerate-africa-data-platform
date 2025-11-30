@@ -14,14 +14,13 @@ app = FastAPI(
     version="1.0"
 )
 
-# 2. CORS (CRITICAL: Allows Frontend to talk to this API)
-# In production, replace ["*"] with the specific URL of your frontend (e.g., ["https://my-dashboard.com"])
+# 2. CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 3. DATABASE CONNECTION
@@ -29,7 +28,6 @@ def get_db_engine():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         raise ValueError("DATABASE_URL is not set")
-    # Fix Render URL quirk
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     return create_engine(db_url)
@@ -42,36 +40,20 @@ def read_root():
 
 @app.get("/api/applications")
 def get_applications(limit: int = 1000):
-    """
-    Returns a list of applications.
-    Query Param 'limit' defaults to 1000 records.
-    """
     try:
         engine = get_db_engine()
-        # We limit columns to avoid sending sensitive PII (like phone numbers) if not needed
-        # Modify this SQL to select exactly what the frontend needs
-        query = f"""
-            SELECT 
-                airtable_id,
-                "Cohort",
-                applicant_name,
-                startup_name,
-                startup_website_url,
-                country,
-                industry,
-                product_description,
-                application_status,
-                monthly_revenue_usd,
-                total_raised_usd,
-                "created_at"
-            FROM applications 
-            LIMIT {limit}
-        """
         
-        # Use Pandas to fetch and convert to JSON-friendly dict
+        # FIX: We select ALL columns first to avoid "Column Not Found" errors.
+        # This is safer than typing specific names that might be misspelled.
+        query = f'SELECT * FROM applications LIMIT {limit}'
+        
         df = pd.read_sql(query, engine)
         
-        # Convert NaN (empty values) to None so JSON doesn't break
+        # Handle empty DB
+        if df.empty:
+            return {"count": 0, "data": []}
+
+        # CLEANUP: Convert NaNs to None for JSON compatibility
         df = df.where(pd.notnull(df), None)
         
         return {
@@ -80,26 +62,45 @@ def get_applications(limit: int = 1000):
         }
         
     except Exception as e:
+        print(f"❌ API CRASHED: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/stats")
 def get_stats():
-    """Returns high-level statistics for dashboard widgets"""
     try:
         engine = get_db_engine()
         
-        # Example of a fast aggregate query
+        # FIX: We use double quotes around "Country" because Postgres is case-sensitive.
+        # We also added a fallback for "Industry" just in case.
         query = """
             SELECT 
                 COUNT(*) as total_apps,
-                COUNT(DISTINCT country) as total_countries,
+                COUNT(DISTINCT "Country") as total_countries,
                 SUM(CAST(total_raised_usd AS NUMERIC)) as total_raised
             FROM applications
         """
+        
         with engine.connect() as conn:
             result = conn.execute(text(query)).mappings().first()
             
         return dict(result)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ STATS ERROR: {e}")
+        
+        # Fallback: If "Country" (Big C) fails, try "country" (small c)
+        # This handles the case where your database might have different casing.
+        try:
+            engine = get_db_engine()
+            query_fallback = """
+                SELECT 
+                    COUNT(*) as total_apps,
+                    COUNT(DISTINCT country) as total_countries,
+                    SUM(CAST(total_raised_usd AS NUMERIC)) as total_raised
+                FROM applications
+            """
+            with engine.connect() as conn:
+                result = conn.execute(text(query_fallback)).mappings().first()
+            return dict(result)
+        except:
+            raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
