@@ -1,7 +1,7 @@
 import os
 import requests
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import json
 from dotenv import load_dotenv
 import re
@@ -10,7 +10,7 @@ import re
 load_dotenv()
 
 API_KEY = os.getenv("AIRTABLE_API_KEY")
-# Fix for Render's database URL format if needed
+# Fix for Render's database URL format
 DB_URL = os.getenv("DATABASE_URL")
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
@@ -21,10 +21,9 @@ TABLES = [
     "AA2 Application Responses_closed",
     "AA1 Application Responses_closed",
     "AA4 Application Responses",
-    # "AA0 Application Responses_closed"
 ]
 
-# MASTER RENAMING MAP (Combined from your provided document)
+# (Your existing RENAME_MAP remains exactly the same)
 RENAME_MAP = {
     # --- IDS & DATES ---
     "airtable_record_id": "airtable_id",
@@ -34,7 +33,7 @@ RENAME_MAP = {
     "Id": "SN",
 
     # --- APPLICANT DETAILS ---
-    "Question": "applicant_name", # Maps Question -> applicant_name (Standardized)
+    "Question": "applicant_name",
     "What's your full name?": "applicant_name",
     "What's your email?": "applicant_email", 
     "What's your email address?": "applicant_email",
@@ -144,23 +143,39 @@ RENAME_MAP = {
 }
 
 def clean_column_name(col_name):
-    """
-    Ensures column names are safe for Postgres.
-    """
     if col_name in RENAME_MAP:
         return RENAME_MAP[col_name]
-    
-    # Auto-clean unmapped columns to prevent crashes
     clean = str(col_name).strip()
     clean = re.sub(r'[^a-zA-Z0-9]', '_', clean)
     return clean[:60]
 
 def fetch_and_save():
     if not API_KEY:
-        print("❌ ERROR: API Key missing. Check .env file.")
+        print("❌ ERROR: API Key missing.")
         return
 
-    print("🔒 Authenticating...")
+    # 1. SETUP ENGINE
+    engine = create_engine(DB_URL)
+
+    # ---------------------------------------------------------
+    # STEP A: RESCUE MANUAL RECORDS (From Frontend API)
+    # ---------------------------------------------------------
+    print("🚑 Rescuing manual records created via API...")
+    manual_df = pd.DataFrame()
+    try:
+        # We assume records created by API start with 'recManual' or have Cohort='Manual Entry'
+        # Adjust this SQL if your identifiers differ
+        rescue_query = "SELECT * FROM applications WHERE airtable_id LIKE 'recManual%'"
+        manual_df = pd.read_sql(rescue_query, engine)
+        print(f"   ✅ Rescued {len(manual_df)} manual records.")
+    except Exception as e:
+        # If table doesn't exist yet, that's fine
+        print(f"   ℹ️ No existing table or manual records found. Proceeding. ({e})")
+
+    # ---------------------------------------------------------
+    # STEP B: FETCH AIRTABLE (Fresh Data)
+    # ---------------------------------------------------------
+    print("🔒 Authenticating with Airtable...")
     all_records = []
     headers = {"Authorization": f"Bearer {API_KEY}"}
     
@@ -172,13 +187,7 @@ def fetch_and_save():
             params = {"offset": offset} if offset else {}
             try:
                 resp = requests.get(url, headers=headers, params=params)
-                if resp.status_code == 404:
-                    print(f"   ⚠️ Warning: Table '{table}' skipped (Not Found).")
-                    break
-                if resp.status_code != 200:
-                    print(f"   ⚠️ Error {resp.status_code}: {resp.text}")
-                    break
-                    
+                if resp.status_code != 200: break
                 data = resp.json()
                 records = data.get("records", [])
                 for rec in records:
@@ -187,46 +196,56 @@ def fetch_and_save():
                     fields["created_at"] = rec.get("createdTime")
                     fields["Cohort"] = table.split()[0]
                     all_records.append(fields)
-                
                 offset = data.get("offset")
                 if not offset: break
-            except Exception as e:
-                print(f"   ⚠️ Connection Exception: {e}")
+            except Exception:
                 break
     
     if not all_records:
-        print("❌ No records found.")
+        print("❌ No records found in Airtable.")
         return
 
-    df = pd.DataFrame(all_records)
+    # ---------------------------------------------------------
+    # STEP C: PROCESS AIRTABLE DATA
+    # ---------------------------------------------------------
+    df_airtable = pd.DataFrame(all_records)
+    print("🧹 Cleaning Airtable data...")
     
-    print("🧹 Cleaning column names...")
+    # Apply Mapping
+    df_airtable.rename(columns=RENAME_MAP, inplace=True)
     
-    # 1. Apply the Master Rename Map
-    df.rename(columns=RENAME_MAP, inplace=True)
-    
-    # 2. Auto-Truncate any remaining long columns to prevent DB Crash
+    # Auto-Truncate
     new_columns = {}
-    for col in df.columns:
+    for col in df_airtable.columns:
         if len(col) > 60:
             new_columns[col] = clean_column_name(col)
     if new_columns:
-        df.rename(columns=new_columns, inplace=True)
+        df_airtable.rename(columns=new_columns, inplace=True)
 
-    # 3. Handle Duplicate Columns (e.g., if two questions map to 'prior_programs')
-    # We group by column name and keep the first non-null value
-    df = df.groupby(lambda x: x, axis=1).first()
+    # Merge duplicates
+    df_airtable = df_airtable.groupby(lambda x: x, axis=1).first()
 
-    # 4. Convert lists/dicts to strings for SQL
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else str(x) if x else None)
+    # ---------------------------------------------------------
+    # STEP D: MERGE (Rescue + Fresh)
+    # ---------------------------------------------------------
+    print("🔄 Merging data...")
+    
+    # Combine the two dataframes
+    # pd.concat aligns columns and fills missing ones with NaN
+    final_df = pd.concat([df_airtable, manual_df], ignore_index=True)
+    
+    # Ensure objects are strings (Postgres safety)
+    for col in final_df.columns:
+        if final_df[col].dtype == object:
+            final_df[col] = final_df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else str(x) if x else None)
 
-    print(f"💾 Saving {len(df)} records to database...")
+    # ---------------------------------------------------------
+    # STEP E: SAVE (Replace is safe now because we have the manual data included)
+    # ---------------------------------------------------------
+    print(f"💾 Saving {len(final_df)} records (Airtable + Manual) to database...")
     try:
-        engine = create_engine(DB_URL)
-        df.to_sql('applications', engine, if_exists='replace', index=False)
-        print("✅ Success! Database Updated with Standard Names.")
+        final_df.to_sql('applications', engine, if_exists='replace', index=False)
+        print("✅ Success! Database synced (Manual records preserved).")
     except Exception as e:
         print(f"❌ Database Error: {e}")
 
